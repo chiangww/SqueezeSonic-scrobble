@@ -57,6 +57,10 @@ sub initPlugin {
 		is_app => 1,
 		weight => 1,
 	);
+	
+	Slim::Utils::Log::logger('plugin.squeezesonic')->debug("Registering handler");
+
+	Slim::Control::Request::subscribe(\&onPlayerEvent, [ ['playlist'] ]);
 }
 
 sub getDisplayName { 'PLUGIN_SQUEEZESONIC' }
@@ -669,5 +673,128 @@ sub _getImage {
 
 sub cleanup {
 	Plugins::SqueezeSonic::API->cacheClear;
+}
+
+use warnings;
+
+# =========================================================================
+# 全域變數 (狀態記憶)
+# =========================================================================
+my %client_states; 
+
+sub onPlayerEvent {
+    my $request = shift;
+    
+    return unless $request;
+    my $client = $request->client();
+    return unless $client;
+
+    my $client_id = $client->id();
+    my $command   = $request->getRequest(0); 
+    my $action    = $request->getRequest(1); 
+
+    # Debug Log: 開啟後可觀察事件流
+    Slim::Utils::Log::logger('plugin.squeezesonic')->debug("Event Fired: $command $action");
+
+    return unless ( ($command eq 'playlist' && $action eq 'newsong') || 
+                    ($command eq 'playlist' && $action eq 'stop')    || 
+                    ($command eq 'player'   && $action eq 'stop') );
+
+    my $now = time();
+
+    # =====================================================================
+    # Phase 1: 結算上一首 (Scrobble Logic)
+    # =====================================================================
+    if ( my $last_state = $client_states{$client_id} ) {
+        
+        my $current_song = $client->playingSong();
+        my $current_url  = ($current_song && $current_song->track()) ? $current_song->track()->url : '';
+
+        # Resume 判斷
+        my $is_resume = ($action eq 'newsong' && $current_url eq $last_state->{url});
+
+        if ( ! $is_resume ) {
+            my $played_seconds = $now - $last_state->{start_time};
+            my $duration       = $last_state->{duration} || 0;
+            my $title          = $last_state->{title} || 'Unknown';
+
+            # 【Scrobble 規則修正】
+            my $should_scrobble = 0;
+            
+            if ($duration > 0) {
+                # 規則 A: 已知長度 -> 播超過 50% 或 超過 240秒
+                if ( ($played_seconds >= $duration * 0.5) || ($played_seconds > 240) ) {
+                    $should_scrobble = 1;
+                }
+            } else {
+                # 規則 B: 未知長度 -> 播超過 60秒
+                if ($played_seconds > 60) {
+                    $should_scrobble = 1;
+                }
+                # 規則 C (新增): 如果未知長度，但事件是 'stop' (代表播完)，且播了超過 30秒
+                # 這是為了補救那些抓不到長度的 FLAC，但 19秒真的太短，通常 Last.fm 標準是 30秒
+                # 如果您堅持要 19秒也算，可以把 30 改成 15
+                elsif ( ($action eq 'stop') && ($played_seconds > 15) ) {
+                    $should_scrobble = 1;
+                    Slim::Utils::Log::logger('plugin.squeezesonic')->info("Force scrobble short track with unknown duration: $title");
+                }
+            }
+
+            if ($should_scrobble) {
+                my $target_nd_id = $last_state->{nd_song_id};
+                if ($target_nd_id) {
+                    Slim::Utils::Log::logger('plugin.squeezesonic')->info("Scrobbling: $title (ID: $target_nd_id, Time: ${played_seconds}/${duration}s)");
+                    eval { Plugins::SqueezeSonic::API->scrobbleTrack($target_nd_id); };
+                    if ($@) { Slim::Utils::Log::logger('plugin.squeezesonic')->error("Scrobble failed: $@"); }
+                }
+            } else {
+                # 顯示為什麼沒 Scrobble (方便除錯)
+                Slim::Utils::Log::logger('plugin.squeezesonic')->info("Skipped: $title (Played: ${played_seconds}s, Duration: ${duration}s)");
+            }
+
+            delete $client_states{$client_id};
+        }
+    }
+
+    # =====================================================================
+    # Phase 2: 記錄新歌 (Start Tracking)
+    # =====================================================================
+    if ( $action eq 'newsong' ) {
+        my $song = $client->playingSong();
+        
+        if ($song && $song->track()) {
+            my $plugin_data = $song->pluginData('squeezesonic');
+            my $nd_id       = $plugin_data ? $plugin_data->{song_id} : undef;
+
+            if ($nd_id) {
+                my $current_url = $song->track()->url;
+
+                if ( !exists $client_states{$client_id} || $client_states{$client_id}->{url} ne $current_url ) {
+                    
+                    # 【三重保險抓時間】
+                    # 1. 資料庫/檔案標頭
+                    my $track_sec = $song->track()->secs;
+                    # 2. LMS 物件屬性 (有時比 track()->secs 準)
+                    my $song_dur  = $song->duration;
+                    # 3. 外掛原始資料 (SqueezeSonic 通常會把 JSON 存在這)
+                    my $plugin_dur = $plugin_data->{duration};
+
+                    # 取三者中大於 0 的第一個值
+                    my $final_duration = $track_sec || $song_dur || $plugin_dur || 0;
+
+                    $client_states{$client_id} = {
+                        url        => $current_url,
+                        nd_song_id => $nd_id,
+                        title      => $song->track()->title,
+                        duration   => $final_duration,
+                        start_time => $now,
+                    };
+                    
+                    # Debug: 印出抓到的時間，確認是否有抓到 19
+                    Slim::Utils::Log::logger('plugin.squeezesonic')->debug("Tracking Start: " . $song->track()->title . " (Detected Duration: $final_duration)");
+                }
+            }
+        }
+    }
 }
 1;

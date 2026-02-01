@@ -121,7 +121,11 @@ sub getNextTrack {
 			$stream = $prefs->get('suburl') . "/rest/stream?id=" . $tid . "&format=" . $format . "&estimateContentLength=true&maxBitRate=" . $bitrate . "&" . $auth;			
 			$br = $bitrate*1000;
 		}
-                $song->pluginData($format);
+# --------------------------
+# ✅ 這裡存 Navidrome / Subsonic 的真正 song id
+$song->pluginData( squeezesonic => {song_id => $track->{id} });
+# --------------------------
+		$song->pluginData($format);
 		$song->streamUrl($stream);
 		$song->duration($track->{duration});
 		$song->bitrate($br);
