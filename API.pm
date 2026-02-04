@@ -81,65 +81,51 @@ sub cacheClear {
 sub get {
     my ($class, $cb, $command, $id, $timeout, $params) = @_;
 
-    # [v72] 策略：只對 ID 進行精準去汙，並執行雙重快取寫入
-    my $raw_id = defined $id ? $id : "";
-    my $cache_key = $command . $raw_id;
+    # [v68] 核心任務：身分完全對齊。
+    # 讓物件內部的 id 欄位，與 LMS 請求的 cache_key 100% 一致。
+    my $raw_id_for_lms = defined $id ? $id : "";
+    my $cache_key = $command . $raw_id_for_lms;
     my $cached = cacheGet($cache_key) || "nc";
 
-    # 1. 快速同步命中 (保住圖示與 5731 行)
     if ($cached ne "nc" && ref($cached) eq 'HASH') {
-        return $cb->($cached); 
+        return $cb->($cached); # 快取命中同步回傳
     }
 
-    # 2. 精準去汙：只針對 getSong 的 ID 欄位
-    my $clean_id = $raw_id;
+    # 靜默去污發送給 Navidrome
     my $clean_params = defined $params ? $params : "";
-    
-    if ($command eq 'getSong') {
-        # 僅移除 ID 後綴，不改動 params 其他部分
-        $clean_id =~ s/-raw\.[a-zA-Z0-9]+//g;
-        $clean_params =~ s/id=[^&]*/id=$clean_id/; # 精準替換參數中的 ID
-    }
-    
+    if ($command eq 'getSong') { $clean_params =~ s/-raw\.[a-zA-Z0-9]+//g; }
     my $query = $command . "?" . $clean_params;
 
     submitQuery(sub {
         my $result = shift;
-        _sanitize_structure($result); # 確保 Boolean 已淨化
+        _sanitize_structure($result); # 除毒
 
         if (defined $result && ref($result) eq 'HASH') {
             if ($command eq 'getSong') {
                 my $s = $result->{'subsonic-response'}->{'song'};
                 if ($s && ref($s) eq 'HASH') {
-                    # 提升 10 個 ProtocolHandler 必讀欄位
-                    foreach my $f (qw(id title album albumId artist artistId duration year bitRate image)) {
+                    # 提升欄位
+                    foreach my $f (qw(title album albumId artist artistId duration year bitRate image)) {
                         $result->{$f} = $s->{$f} if exists $s->{$f};
                     }
-                    $result->{image} ||= $s->{coverArt};
-                    # 影子屬性：確保 Scrobble 使用乾淨 ID
-                    $result->{song_id} = $clean_id; 
+                    $result->{image} ||= $s->{coverArt}; 
+
+                    # 【v68 關鍵修正】強行將 ID 設為 LMS 想要的那個帶後綴的 ID
+                    # 這能確保 LMS 認得這份資料的「身分」，從而亮起圖示
+                    $result->{id} = $raw_id_for_lms; 
+                    
+                    # 但 Scrobble 必須用乾淨的 ID，所以保留 song_id 為乾淨版
+                    $result->{song_id} = $s->{id}; 
                 }
             }
 
-            # =================================================================
-            # 【v72 核心：精準雙重寫入】
-            # =================================================================
-            # 寫入 A：原始 Key (可能是帶 -raw 的，給播放 UI 用)
             cacheSet($cache_key, $result, $timeout);
-            
-            # 寫入 B：乾淨 Key (給 1 小時後不帶 -raw 的查勤用)
-            my $alt_key = $command . $clean_id;
-            if ($alt_key ne $cache_key) {
-                cacheSet($alt_key, $result, $timeout);
-            }
-            # =================================================================
-
-            $cb->($result);
+            $cb->($result); # 異步回調
         }
     }, $query);
 
-    # 核心保修：同步階段回傳 Reference 避開 5731
-    return $cb->({}); 
+    # 核心保險：避開 5731 報錯
+    if ($command eq 'getSong') { return $cb->({}); }
 }
 
 sub _sanitize_structure {
