@@ -10,3 +10,7 @@ Have fun
 ---
 2026-02-01 by cww@Taiwan
 Work with Gemini 3, enhance SqueezeSonic with Scrobble support and long-term stability fixes for Lyrion Music Server & Navidrome.
+
+---
+2026-10-18 by cww@Taiwan
+Work with Hermes-Agent and Qwen3.8 Flash Next fixes some mysterious bugs.
