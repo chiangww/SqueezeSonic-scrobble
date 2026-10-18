@@ -114,7 +114,10 @@ sub getNextTrack {
 
 		$tid = $track->{streamId} if $track->{type} eq 'podcast';
 
-		if ($format eq $track->{suffix}) {
+		if ($format eq $track->{suffix} || $format eq "flc") {
+			# Navidrome >= 0.61 no longer falls back to raw for unknown formats:
+			# format=flc would silently transcode to mp3 while LMS still expects
+			# FLAC. Ask for raw instead (flc is only LMS internal codec name).
 			$format = "raw";
 		}
 		my $transcode = "format=" . $format;
