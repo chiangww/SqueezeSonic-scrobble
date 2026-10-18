@@ -5,6 +5,7 @@ use strict;
 
 use JSON::XS::VersionOneAndTwo;
 use Digest::MD5 qw(md5_hex);
+use Time::HiRes ();
 
 use Slim::Utils::Cache;
 use Slim::Utils::Log;
@@ -14,13 +15,20 @@ my $cache = Slim::Utils::Cache->new('squeezesonic', 6);
 my $prefs = preferences('plugin.squeezesonic');
 my $log = logger('plugin.squeezesonic');
 
+my $authCache;
+my $authFor;
 sub getAuth {
 	my $user = $prefs->get('username');
 	my $pass = $prefs->get('password');
+	# Stable auth: a fresh random salt per call made every cover URL unique,
+	# so LMS reloaded (flickered) artwork on each 10s status poll. Reuse one
+	# salt/token per credential set; Subsonic accepts any valid token+salt pair.
+	return $authCache if defined $authCache && $authFor eq ($user . "\0" . $pass);
 	my @chars = ('A'..'Z', 'a'..'z', 0..9);
 	my $salt = join '', map $chars[rand @chars], 0..8;
         my $token = md5_hex($pass . $salt);
 	my $auth = "u=$user&t=$token&s=$salt&v=1.11.0&f=json&c=SqueezeSonic";
+	($authFor, $authCache) = ($user . "\0" . $pass, $auth);
 	return $auth;
 }
 
@@ -80,6 +88,8 @@ sub cacheClear {
 
 sub get {
     my ($class, $cb, $command, $id, $timeout, $params) = @_;
+    my $served_stale;
+    my ($client) = grep { $_ && $_->can('currentPlaylistUpdateTime') } Slim::Player::Client::clients();
 
     # [v68] 核心任務：身分完全對齊。
     # 讓物件內部的 id 欄位，與 LMS 請求的 cache_key 100% 一致。
@@ -119,13 +129,44 @@ sub get {
                 }
             }
 
+            my $prev_stale = $command eq 'getSong' ? $cache->get("stale:" . $cache_key) : undef;
             cacheSet($cache_key, $result, $timeout);
-            $cb->($result); # 異步回調
+            $cache->set("stale:" . $cache_key, $result, 86400) if $command eq 'getSong';
+            if ($served_stale) {
+                # skip the poke when nothing visible changed, otherwise LMS
+                # re-reads the whole playlist and the artwork flickers.
+                my $same = ref($prev_stale) eq 'HASH' && (
+                       ($prev_stale->{title}    // '') eq ($result->{title}    // '')
+                    && ($prev_stale->{coverArt} // '') eq ($result->{coverArt} // '')
+                    && ($prev_stale->{image}    // '') eq ($result->{image}    // '')
+                    && ($prev_stale->{artist}   // '') eq ($result->{artist}   // '')
+                    && ($prev_stale->{album}    // '') eq ($result->{album}    // '')
+                    && ($prev_stale->{bitRate}  // 0)  == ($result->{bitRate}  // 0)
+                );
+                if ($same) { $served_stale = 0; }
+            }
+            if ($served_stale) {
+                # we already handed the caller stale data; now that fresh
+                # data is cached, tell LMS to re-read (refresh artwork).
+                eval {
+                    $client->currentPlaylistUpdateTime( Time::HiRes::time() ) if $client;
+                    Slim::Control::Request::notifyFromArray( $client, [ 'newmetadata' ] ) if $client;
+                };
+            } else {
+                $cb->($result); # 異步回調
+            }
         }
     }, $query);
 
     # 核心保險：避開 5731 報錯
-    if ($command eq 'getSong') { return $cb->({}); }
+    if ($command eq 'getSong') {
+        my $stale = $cache->get("stale:" . $cache_key);
+        if (ref($stale) eq 'HASH' && ($stale->{title} || $stale->{id})) {
+            $served_stale = 1;
+            return $cb->($stale);
+        }
+        return $cb->({});
+    }
 }
 
 sub _sanitize_structure {

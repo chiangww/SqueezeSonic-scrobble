@@ -6,6 +6,11 @@ use Scalar::Util qw(blessed);
 use Slim::Utils::Log;
 use Slim::Utils::Misc;
 use Slim::Utils::Prefs;
+use Time::HiRes;
+
+# last good getMetadataFor results, keyed by url; survives the API cache expiring
+my %metaCache;
+my %notifyPending;
 
 use Plugins::SqueezeSonic::API;
 
@@ -68,10 +73,19 @@ sub getMetadataFor {
 	my ( $class, $client, $url ) = @_;
 
 	my ($id) = $url =~ m{^sonics?://(.+?)$};
-	Plugins::SqueezeSonic::API->get(sub {
+	my $missed;
+	my $meta = Plugins::SqueezeSonic::API->get(sub {
 		my $track = shift;
 		my $bitrate;
-		
+
+		# On API cache expiry API->get first calls back with an empty {} and
+		# fetches in the background. Serving the stale-but-good metadata here
+		# keeps LMS artwork intact; the async call below refreshes and pokes.
+		if ( !( ref($track) eq 'HASH' && ($track->{title} || $track->{id}) ) ) {
+			$missed = 1;
+			return $metaCache{$url} || {};
+		}
+
 		my ($format) = $url =~ m{\.(.+?)$};
 
 		my ($bitrate) = ($url =~ m{-(.*)\.});
@@ -84,7 +98,9 @@ sub getMetadataFor {
                 	albumId  => $track->{albumId} || '',
                 	artist   => $track->{artist} || '',
                 	artistId => $track->{artistId} || '',
-                	cover    => $track->{image} || '',
+                	cover    => ($track->{coverArt} || $track->{image})
+                        ? Plugins::SqueezeSonic::Plugin::_getImage($track->{coverArt} || $track->{image})
+                        : '',
                 	duration => $track->{duration} || 0,
                 	year     => $track->{year} || 0,
 			type	 => $format || '',
@@ -92,8 +108,23 @@ sub getMetadataFor {
         	};
 
 		$meta->{bitrate} = sprintf("%.0f" . Slim::Utils::Strings::string('KBPS'), $meta->{bitrate});
+
+		$metaCache{$url} = $meta;
+		%metaCache = () if keys(%metaCache) > 2000;
+
+		# If this callback is the async completion of an earlier cache miss,
+		# tell LMS to re-read metadata so refreshed artwork/titles show up.
+		if ($missed && $client) {
+			eval {
+				$client->currentPlaylistUpdateTime( Time::HiRes::time() );
+				Slim::Control::Request::notifyFromArray( $client, [ 'newmetadata' ] );
+			};
+		}
+
 		return $meta;
 	},'getSong',$id,$prefs->get('tmusic'),"id=" . $id);
+
+	return $meta;
 }
 
 sub getNextTrack {
